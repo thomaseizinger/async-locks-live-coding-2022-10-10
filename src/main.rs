@@ -1,13 +1,70 @@
 use async_std::io::stdin;
-use async_std::net::{TcpListener, TcpStream};
-use asynchronous_codec::{Framed, FramedRead};
+use async_std::net::{Incoming, TcpListener, TcpStream};
+use asynchronous_codec::{Framed, FramedRead, LinesCodec};
 use futures::future::Either;
 use futures::{future, SinkExt, StreamExt};
-use std::sync::{Arc, Mutex};
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
+use std::io;
+use std::net::SocketAddr;
+use std::task::{Context, Poll};
 
-#[derive(Default)]
-struct PingState {
+struct PingCounter<'a> {
+    incoming: Incoming<'a>,
     num_pings: u64,
+
+    pending_messages: HashMap<SocketAddr, String>,
+
+    streams: HashMap<SocketAddr, Framed<TcpStream, LinesCodec>>,
+}
+
+impl<'a> PingCounter<'a> {
+    fn new(incoming: Incoming<'a>) -> Self {
+        Self {
+            incoming,
+            num_pings: 0,
+            pending_messages: Default::default(),
+            streams: Default::default(),
+        }
+    }
+
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        loop {
+            for (addr, socket) in &mut self.streams {
+                match self.pending_messages.entry(*addr) {
+                    Entry::Occupied(entry) => {
+                        if socket.poll_ready_unpin(cx).is_ready() {
+                            socket.start_send_unpin(entry.remove())?;
+                        }
+                    }
+                    Entry::Vacant(vacant) => {
+                        if let Poll::Ready(Some(new_message)) = socket.poll_next_unpin(cx)? {
+                            match new_message.as_str() {
+                                "ping\n" => {
+                                    self.num_pings += 1;
+
+                                    vacant.insert(format!("{}\n", self.num_pings));
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+
+                let _ = socket.poll_flush_unpin(cx)?;
+            }
+
+            if let Poll::Ready(Some(stream)) = self.incoming.poll_next_unpin(cx)? {
+                let addr = stream.peer_addr()?;
+
+                self.streams.insert(addr, Framed::new(stream, LinesCodec));
+                continue;
+            }
+
+            return Poll::Pending;
+        }
+    }
 }
 
 #[async_std::main]
@@ -15,33 +72,11 @@ async fn main() {
     match std::env::args().nth(1) {
         None => {
             let listener = TcpListener::bind("127.0.0.1:8000").await.unwrap();
-            let state = Arc::new(Mutex::new(PingState::default()));
+
+            let mut ping_counter = PingCounter::new(listener.incoming());
 
             loop {
-                let (stream, _) = listener.accept().await.unwrap();
-                let mut stream = Framed::new(stream, asynchronous_codec::LinesCodec);
-
-                async_std::task::spawn({
-                    let state = state.clone();
-
-                    async move {
-                        loop {
-                            match stream.next().await.unwrap().unwrap().as_str() {
-                                "ping\n" => {
-                                    let pings = {
-                                        let mut guard = state.lock().unwrap();
-                                        guard.num_pings += 1;
-
-                                        guard.num_pings
-                                    };
-
-                                    stream.send(format!("{}\n", pings)).await.unwrap();
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                });
+                future::poll_fn(|cx| ping_counter.poll(cx)).await.unwrap();
             }
         }
         Some(port) => {
