@@ -6,11 +6,7 @@ use futures::{future, SinkExt, StreamExt};
 
 #[async_std::main]
 async fn main() {
-    let port = std::env::args().nth(1).unwrap();
-
-    let stream = TcpStream::connect(format!("127.0.0.1:{port}"))
-        .await
-        .unwrap();
+    let stream = TcpStream::connect("127.0.0.1:8000").await.unwrap();
 
     let mut stream = Framed::new(stream, LinesCodec);
     let mut stdin = FramedRead::new(stdin(), LinesCodec);
@@ -20,10 +16,10 @@ async fn main() {
             Either::Left((Some(Ok(stream_line)), _)) => {
                 let num_pings = stream_line.replace('\n', "").parse::<u64>().unwrap();
 
-                println!("Number of pings: {num_pings}")
+                println!("Num pings: {num_pings}");
             }
-            Either::Right((Some(Ok(new_message)), _)) => {
-                stream.send(new_message).await.unwrap();
+            Either::Right((Some(Ok(line)), _)) => {
+                stream.send(line).await.unwrap();
             }
             _ => return,
         }
